@@ -1,0 +1,238 @@
+name: Native Binaries (Android Only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Artifact version, for example 1.0.0.'
+        required: true
+        default: '1.0.0'
+      release_tag:
+        description: 'Release tag to create/update, for example v1.0.0.'
+        required: true
+        default: 'v1.0.0'
+  push:
+    tags:
+      - 'v*'
+      - 'native-v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build-java:
+    name: Build Java API
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      release_tag: ${{ steps.ver.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@main
+
+      - name: Setup JDK 21
+        uses: actions/setup-java@main
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Resolve version and release tag
+        id: ver
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            RELEASE_TAG="${GITHUB_REF#refs/tags/}"
+            VERSION="${RELEASE_TAG#native-v}"
+            VERSION="${VERSION#v}"
+          else
+            RELEASE_TAG="${{ github.event.inputs.release_tag }}"
+            VERSION="${{ github.event.inputs.version }}"
+          fi
+
+          echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Release tag: ${RELEASE_TAG}"
+          echo "Version: ${VERSION}"
+
+      - name: Compile Java
+        run: |
+          set -euo pipefail
+          chmod +x tools/compile.sh
+          tools/compile.sh linux64
+
+      - name: Package Java API jar
+        run: |
+          set -euo pipefail
+          chmod +x scripts/package-portable.sh
+          scripts/package-portable.sh "${{ steps.ver.outputs.version }}" dist
+
+      - name: Upload Java API artifacts
+        uses: actions/upload-artifact@main
+        with:
+          name: jcef-orion-java-api
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  build-android:
+    name: Build Android (arm64-v8a)
+    needs: build-java
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@main
+
+      - name: Setup JDK 21
+        uses: actions/setup-java@main
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ninja-build
+
+      - name: Set up Android NDK
+        run: |
+          echo "ANDROID_NDK_HOME=${ANDROID_NDK_LATEST_HOME}" >> $GITHUB_ENV
+          echo "NDK=${ANDROID_NDK_LATEST_HOME}" >> $GITHUB_ENV
+
+      - name: Configure CMake for Android
+        env:
+          CMAKE_C_FLAGS: "-O3 -mllvm -polly -mllvm -polly-vectorizer=stripmine -mllvm -polly-invariant-load-hoisting -mllvm -polly-run-inliner -mllvm -polly-run-dce -mllvm -polly-detect-keep-going -mllvm -polly-ast-use-context -mllvm -polly-parallel -mllvm -inlinehint-threshold=100000 -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D__USE_GNU"
+          CMAKE_CXX_FLAGS: "-O3 -mllvm -polly -mllvm -polly-vectorizer=stripmine -mllvm -polly-invariant-load-hoisting -mllvm -polly-run-inliner -mllvm -polly-run-dce -mllvm -polly-detect-keep-going -mllvm -polly-ast-use-context -mllvm -polly-parallel -mllvm -inlinehint-threshold=100000 -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D__USE_GNU"
+          CMAKE_SHARED_LINKER_FLAGS: "-Wl,--gc-sections -Wl,--as-needed -static-libstdc++ -Wl,--exclude-libs,ALL"
+        run: |
+          cmake -S . -B build \
+            -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-26 \
+            -DANDROID_STL=c++_static \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS="${CMAKE_C_FLAGS}" \
+            -DCMAKE_CXX_FLAGS="${CMAKE_CXX_FLAGS}" \
+            -DCMAKE_SHARED_LINKER_FLAGS="${CMAKE_SHARED_LINKER_FLAGS}" \
+            -DJCEF_DOWNLOAD_CLANG_FORMAT=OFF
+
+      - name: Build native library
+        run: cmake --build build --config Release --parallel
+
+      - name: Locate and prepare libjcef.so
+        run: |
+          set -euo pipefail
+          # 假设生成的 .so 位于 build/lib/ 或 build/ 下，根据实际项目调整
+          SO_PATH=$(find build -name "libjcef.so" | head -1)
+          if [[ -z "${SO_PATH}" ]]; then
+            echo "::error::libjcef.so not found"
+            exit 1
+          fi
+          mkdir -p native/android-arm64
+          cp "${SO_PATH}" native/android-arm64/libjcef.so
+
+      - name: Download Java API jar
+        uses: actions/download-artifact@main
+        with:
+          name: jcef-orion-java-api
+          path: api-jar
+
+      - name: Embed native library into jar
+        env:
+          VERSION: ${{ needs.build-java.outputs.version }}
+        run: |
+          set -euo pipefail
+          JAR_NAME="jcef-orion-${VERSION}.jar"
+          ANDROID_JAR_NAME="jcef-orion-${VERSION}-android.jar"
+          cp "api-jar/${JAR_NAME}" "${ANDROID_JAR_NAME}"
+          # 将 native/android-arm64 目录添加到 jar 根目录
+          (cd native && zip -r "../${ANDROID_JAR_NAME}" android-arm64)
+          # 同时保留原始 jar 副本（纯 API），但只上传带 so 的 android jar
+          mkdir -p dist-android
+          cp "${ANDROID_JAR_NAME}" dist-android/
+          # 如果需要 sources 和 pom，也可以一并复制（来自 api-jar）
+          cp api-jar/*-sources.jar dist-android/ 2>/dev/null || true
+          cp api-jar/*.pom dist-android/ 2>/dev/null || true
+
+      - name: Upload Android artifacts
+        uses: actions/upload-artifact@main
+        with:
+          name: jcef-orion-android
+          path: dist-android/
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Publish release
+    needs:
+      - build-java
+      - build-android
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: write
+    steps:
+      - name: Download Java API artifacts
+        uses: actions/download-artifact@main
+        with:
+          name: jcef-orion-java-api
+          path: java-api
+
+      - name: Download Android artifacts
+        uses: actions/download-artifact@main
+        with:
+          name: jcef-orion-android
+          path: android
+
+      - name: Prepare release assets
+        run: |
+          set -euo pipefail
+          mkdir -p publish-assets
+          # 复制 Android jar（包含 so）
+          cp android/*.jar publish-assets/
+          # 复制 sources 和 pom（从 Java API）
+          cp java-api/*-sources.jar publish-assets/ 2>/dev/null || true
+          cp java-api/*.pom publish-assets/ 2>/dev/null || true
+          (
+            cd publish-assets
+            sha256sum * > SHA256SUMS.txt
+            ls -lh
+          )
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.build-java.outputs.release_tag }}
+          name: ${{ needs.build-java.outputs.release_tag }}
+          fail_on_unmatched_files: true
+          overwrite_files: true
+          files: |
+            publish-assets/*
+
+  cleanup-actions-artifacts:
+    name: Delete temporary Actions artifacts
+    needs:
+      - build-java
+      - build-android
+      - release
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Delete temporary Actions artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          artifacts="$(gh api "repos/${REPOSITORY}/actions/runs/${RUN_ID}/artifacts" --paginate --jq '.artifacts[].id')"
+          if [[ -z "${artifacts}" ]]; then
+            echo "No temporary artifacts found."
+            exit 0
+          fi
+
+          for artifact_id in ${artifacts}; do
+            echo "Deleting artifact ${artifact_id}"
+            gh api --method DELETE "repos/${REPOSITORY}/actions/artifacts/${artifact_id}"
+          done
